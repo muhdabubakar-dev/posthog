@@ -1,4 +1,4 @@
-import asyncio
+import json
 from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol
 
 from django.db.models import F
@@ -8,7 +8,6 @@ import pyarrow.compute as pc
 import posthoganalytics
 from structlog.types import FilteringBoundLogger
 
-from posthog.dataclasses import frozen
 from posthog.exceptions_capture import capture_exception
 from posthog.sync import database_sync_to_async_pool
 from posthog.temporal.common.logger import get_logger
@@ -47,15 +46,6 @@ if TYPE_CHECKING:
 LOGGER = get_logger(__name__)
 
 
-@frozen
-class PostLoadResult:
-    #: The query folder the table now serves from. None when there is no Delta table.
-    queryable_folder: str | None
-    #: True when post-load recorded the table size from the Delta log. When False, the caller has
-    #: to get the size measured in another way.
-    table_size_written: bool = False
-
-
 async def update_job_row_count(job_id: str, count: int, logger: FilteringBoundLogger) -> None:
     await logger.adebug(f"Updating rows_synced with +{count}")
     await database_sync_to_async_pool(
@@ -82,8 +72,104 @@ class IncrementalFieldMissingFromDataError(Exception):
         )
 
 
+_UNRESOLVED = object()
+
+
+def _get_json_path_value(raw_value: Any, path: list[str]) -> Any:
+    """Walk a JSON string's object members; distinguish a missing member from null."""
+    if raw_value is None:
+        return _UNRESOLVED  # a null root does not establish that the nested member exists
+
+    try:
+        value = json.loads(raw_value)
+    except (json.JSONDecodeError, TypeError):
+        return _UNRESOLVED  # not JSON -> path unresolvable
+
+    for part in path:
+        if value is None:
+            return _UNRESOLVED  # null intermediate parent; the leaf was never observed
+        if not isinstance(value, dict) or part not in value:
+            return _UNRESOLVED  # structurally missing -> unresolvable
+        value = value[part]
+
+    if isinstance(value, (dict, list)):
+        return _UNRESOLVED  # leaf must be scalar
+    return value
+
+
+def parse_member_path(path: str) -> list[str] | None:
+    """Parse a simple dotted member path, optionally prefixed with '$.'.
+
+    Supported: "meta.updated_at", "$.meta.updated_at", "updated_at"
+    Not supported: array indexes, wildcards, filters, or quoted JSONPath keys.
+    Only member access is accepted because a cursor must resolve to at most one
+    scalar per record.
+    """
+    path = path.strip()
+
+    if path.startswith("$."):
+        path = path[2:]
+    elif path.startswith("$"):
+        return None
+
+    if not path:
+        return None
+
+    parts = path.split(".")
+    if any(not part or part != part.strip() or any(char in part for char in "$[]*?'\"") for part in parts):
+        return None
+
+    return parts
+
+
+def resolve_incremental_values(table: pa.Table, field_name: str) -> list | None:
+    """Return row-aligned raw cursor values, or None if the field cannot be resolved.
+
+    For parsed dotted paths, only the top-level column name is normalized; nested
+    JSON keys retain their source spelling. Nested paths can resolve from JSON-string
+    columns. If at least one row resolves, unresolved rows are None; otherwise the
+    normalized flat-column lookup is tried, including for paths rejected by the parser
+    and for a batch whose nested root is entirely null.
+    """
+
+    parts = parse_member_path(field_name)
+    empty_nested_root = False
+
+    if parts is not None:
+        root_name = normalize_column_name(parts[0])
+        if root_name in table.column_names:
+            root_column = table[root_name]
+            # Nested struct/list columns may already be JSON strings here, serialized upstream by
+            # evolve_pyarrow_schema; resolve dotted paths from that representation.
+            if len(parts) > 1 and (pa.types.is_string(root_column.type) or pa.types.is_large_string(root_column.type)):
+                root_values = root_column.to_pylist()
+                if not root_values or all(value is None for value in root_values):
+                    # Nothing observed through the nested path this batch, but the normalized flat
+                    # column may still carry the field; defer before leaving the cursor alone.
+                    empty_nested_root = True
+                else:
+                    values = [_get_json_path_value(v, parts[1:]) for v in root_values]
+                    if any(v is not _UNRESOLVED for v in values):
+                        return [None if v is _UNRESOLVED else v for v in values]
+
+    # Fallback: a real top-level column. Covers single-segment paths, pre-flattened
+    # keys such as "meta_updated_at", and (compatibility) names that are not valid
+    # member paths but still normalize onto a real flat column.
+    flat_name = normalize_column_name(".".join(parts) if parts is not None else field_name)
+    if flat_name and flat_name in table.column_names:
+        column = table[flat_name]
+        if not pa.types.is_nested(column.type):
+            return column.to_pylist()
+
+    if empty_nested_root:
+        return []  # nothing observed anywhere -> leave the cursor alone
+    return None
+
+
 def get_incremental_field_value(
-    schema: ExternalDataSchema | None, table: pa.Table, aggregate: Literal["max"] | Literal["min"] = "max"
+    schema: ExternalDataSchema | None,
+    table: pa.Table,
+    aggregate: Literal["max"] | Literal["min"] = "max",
 ) -> Any:
     # CDC and xmin schemas track their own cursor (CDC log position, xmin ceiling) outside of
     # sync_type_config["incremental_field"] — that key can be a stale leftover from a prior
@@ -95,21 +181,26 @@ def get_incremental_field_value(
     if incremental_field_name is None:
         return None
 
-    normalized_field_name = normalize_column_name(incremental_field_name)
-    if normalized_field_name not in table.column_names:
+    if aggregate not in ("max", "min"):
+        raise Exception(f"Unsupported aggregate function for get_incremental_field_value: {aggregate}")
+
+    raw_values = resolve_incremental_values(table, incremental_field_name)
+    if raw_values is None:
         raise IncrementalFieldMissingFromDataError(incremental_field_name, table)
 
-    column = table[normalized_field_name]
-    processed_column = pa.array(
-        [process_incremental_value(val, schema.incremental_field_type) for val in column.to_pylist()]
-    )
+    processed_values = [
+        process_incremental_value(value, schema.incremental_field_type) for value in raw_values if value is not None
+    ]
+    if not processed_values:
+        # Empty batch, or every row null: leave the cursor where it is.
+        return None
+
+    processed_column = pa.array(processed_values)
 
     if aggregate == "max":
         last_value = pc.max(processed_column)
-    elif aggregate == "min":
-        last_value = pc.min(processed_column)
     else:
-        raise Exception(f"Unsupported aggregate function for get_incremental_field_value: {aggregate}")
+        last_value = pc.min(processed_column)
 
     return last_value.as_py()
 
@@ -321,22 +412,6 @@ def _stored_sync_type_config(schema_id: Any, team_id: int) -> Any:
     )
 
 
-async def _live_file_sizes(delta_table_ref: "DeltaTableRef") -> dict[str, int]:
-    """The size of each live file from the Delta log, keyed by its path relative to the table folder.
-
-    Read from the same cached handle as the file URIs, so the two describe one snapshot. Empty when
-    the log cannot give the sizes; the publish step then reads each size from S3 as before.
-    """
-    delta_table = await delta_table_ref.get_delta_table()
-    if delta_table is None:
-        return {}
-    try:
-        sizes = await asyncio.to_thread(delta_table._table.get_add_file_sizes)
-    except Exception:
-        return {}
-    return {path: size for path, size in sizes.items() if isinstance(size, int)}
-
-
 @recorded_phase("publish")
 async def _publish_queryable_files(
     job: ExternalDataJob,
@@ -383,17 +458,8 @@ async def _publish_queryable_files(
 
     # File URIs are listed after delta maintenance so the queryable folder serves the compacted
     # layout rather than the pre-compaction small files.
-    file_sizes: dict[str, int] = {}
-
-    async def _list_live_files() -> list[str]:
-        uris = await delta_table_ref.get_file_uris()
-        sizes = await _live_file_sizes(delta_table_ref)
-        file_sizes.clear()
-        file_sizes.update(sizes)
-        return uris
-
     with post_load_phase("list_live_files"):
-        file_uris = await _list_live_files()
+        file_uris = await delta_table_ref.get_file_uris()
         note_post_load_phase(live_files=len(file_uris))
     logger.debug(f"Preparing S3 files - total parquet files: {len(file_uris)}")
     with POST_LOAD_DURATION_SECONDS.labels(operation="prepare_s3").time():
@@ -404,10 +470,9 @@ async def _publish_queryable_files(
             delete_existing=True,
             existing_queryable_folder=existing_queryable_folder,
             logger=logger,
-            refresh_file_uris=_list_live_files,
+            refresh_file_uris=delta_table_ref.get_file_uris,
             double_buffer=True,
             pointer_history=pointer_history,
-            file_sizes=file_sizes,
         )
     return folder
 
@@ -446,8 +511,7 @@ async def _register_table(
     resource: "Optional[SourceResponse]",
     queryable_folder: str,
     logger: FilteringBoundLogger,
-) -> bool:
-    """Returns True when the table size from the Delta log went to the registration."""
+) -> None:
     from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline_sync import (
         validate_schema_and_update_table,
     )
@@ -456,13 +520,11 @@ async def _register_table(
     # snapshot rather than from another log read.
     delta_table = await delta_table_ref.get_delta_table()
     delta_schema_json = delta_table.schema().to_json() if delta_table is not None else None
-    # The run count is not the table size, even for a full refresh: a run that resumes counts only
-    # the rows of its last attempt. The handle is the one the publish step listed, so the count
-    # matches the files the query folder now holds.
-    live_row_count = await delta_table_ref.get_live_row_count()
-    # Same handle, so the size is the size of the files the query folder now holds. Maintenance ran
-    # before the publish step, so a compaction in this run is already in the number.
-    live_size_mib = await delta_table_ref.get_live_size_mib()
+    # Only a table whose run count is not its size reads the count. The handle is the one the publish
+    # step listed, so the count matches the files the query folder now holds.
+    live_row_count = (
+        await delta_table_ref.get_live_row_count() if schema.table_row_count_is_cumulative or row_count == 0 else None
+    )
 
     logger.debug("Validating schema and updating table")
     with POST_LOAD_DURATION_SECONDS.labels(operation="validate_schema").time():
@@ -477,10 +539,8 @@ async def _register_table(
             primary_keys=resource.primary_keys if resource is not None else None,
             delta_schema_json=delta_schema_json,
             live_row_count=live_row_count,
-            live_size_mib=live_size_mib,
         )
     logger.debug("Finished validating schema and updating table")
-    return live_size_mib is not None
 
 
 @recorded_phase("cdc_post_load")
@@ -516,7 +576,6 @@ async def _run_cdc_post_load(
                 table_schema_dict=table_schema_dict,
                 set_as_schema_table=schema.cdc_table_mode == "cdc_only",
                 live_row_count=await delta_table_ref.get_live_row_count(),
-                live_size_mib=await delta_table_ref.get_live_size_mib(),
             )
         logger.debug("Finished registering CDC companion table")
         return
@@ -620,7 +679,7 @@ async def _maybe_flag_repartition_step(
 
     delta_table = await delta_table_ref.get_delta_table()
     if delta_table is not None:
-        await maybe_flag_for_repartition(schema, source, job, delta_table, logger, phase="post_load")
+        await maybe_flag_for_repartition(schema, source, job, delta_table, logger)
 
 
 # Product-facing side effects outside the core publish/register flow. Entries share the PostLoadStep
@@ -671,7 +730,7 @@ async def run_post_load_operations(
     last_incremental_field_value: Any = None,
     resource: "Optional[SourceResponse]" = None,
     cdc_write_mode: Optional[str] = None,
-) -> PostLoadResult:
+) -> Optional[str]:
     """
     Orchestrator that runs all post-load operations, in order:
         1. Delta maintenance (compact when fragmented, otherwise vacuum on commit cadence)
@@ -682,8 +741,7 @@ async def run_post_load_operations(
         6. POST_LOAD_STEPS: product side effects (revenue notification, revenue/engineering
            analytics views, repartition detection)
 
-    Returns the queryable folder the table now serves from (None when there is no delta table), and
-    whether the register step recorded the table size.
+    Returns the queryable folder the table now serves from, or None when there is no delta table.
     """
     if delta_table_ref is None or await delta_table_ref.get_delta_table() is None:
         # A clean run that wrote zero rows creates no delta table, so there is nothing to publish or
@@ -692,7 +750,7 @@ async def run_post_load_operations(
         # initial-synced" on every subsequent run.
         logger.debug("No deltalake table; finalizing bookkeeping for a zero-row run")
         await _finalize_sync_bookkeeping(job, schema, resource, last_incremental_field_value, logger)
-        return PostLoadResult(queryable_folder=None)
+        return None
 
     # Detect CDC companion writes — scd2_append writes always go to the companion _cdc resource.
     # In this case we must NOT touch schema.table (the snapshot table) and must register the companion
@@ -716,9 +774,8 @@ async def run_post_load_operations(
     # The DeltaLake files still exist on S3 for the seeding step to read from.
     is_cdc_only_initial = cdc_write_mode is None and is_cdc_schema and schema.cdc_table_mode == "cdc_only"
 
-    table_size_written = False
     if not is_cdc_companion and not is_cdc_only_initial:
-        table_size_written = await _register_table(
+        await _register_table(
             job, schema, delta_table_ref, row_count, table_schema_dict, resource, queryable_folder, logger
         )
 
@@ -740,4 +797,4 @@ async def run_post_load_operations(
 
     await _run_post_load_steps(job, schema, source, delta_table_ref, is_cdc_companion, logger)
 
-    return PostLoadResult(queryable_folder=queryable_folder, table_size_written=table_size_written)
+    return queryable_folder

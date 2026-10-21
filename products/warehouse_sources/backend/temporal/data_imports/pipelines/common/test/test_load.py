@@ -14,9 +14,10 @@ from products.warehouse_sources.backend.models.external_data_schema import Exter
 from products.warehouse_sources.backend.temporal.data_imports.external_data_job import Any_Source_Errors
 from products.warehouse_sources.backend.temporal.data_imports.pipelines.common.load import (
     IncrementalFieldMissingFromDataError,
-    PostLoadResult,
     get_incremental_field_value,
+    normalize_column_name,
     notify_revenue_analytics_that_sync_has_completed,
+    parse_member_path,
     run_post_load_operations,
     update_job_row_count,
 )
@@ -60,20 +61,11 @@ def _make_schema(
     return schema
 
 
-def _make_helper(
-    *,
-    file_uris: list[str] | None = None,
-    live_row_count: int | None = None,
-    live_size_mib: float | None = None,
-    file_sizes: dict[str, int] | None = None,
-) -> MagicMock:
-    delta_table = MagicMock()
-    delta_table._table.get_add_file_sizes.return_value = file_sizes or {}
+def _make_helper(*, file_uris: list[str] | None = None, live_row_count: int | None = None) -> MagicMock:
     return MagicMock(
-        get_delta_table=AsyncMock(return_value=delta_table),
+        get_delta_table=AsyncMock(return_value=MagicMock()),
         get_file_uris=AsyncMock(return_value=file_uris or []),
         get_live_row_count=AsyncMock(return_value=live_row_count),
-        get_live_size_mib=AsyncMock(return_value=live_size_mib),
     )
 
 
@@ -85,9 +77,7 @@ async def _run_post_load(
     resource: Optional[MagicMock] = None,
     stored_sync_type_config: dict | None = None,
     validate: AsyncMock | None = None,
-    register_companion: AsyncMock | None = None,
     row_count: int = 10,
-    results: list[PostLoadResult] | None = None,
 ) -> tuple[AsyncMock, AsyncMock]:
     job = MagicMock()
     job.id = uuid.uuid4()
@@ -107,10 +97,10 @@ async def _run_post_load(
         patch.object(DeltaMaintenance, "run_scheduled", run_scheduled),
         patch(f"{_PIPELINE_SYNC_MODULE}.update_last_synced_at", AsyncMock()),
         patch(f"{_PIPELINE_SYNC_MODULE}.validate_schema_and_update_table", validate or AsyncMock()),
-        patch(f"{_PIPELINE_SYNC_MODULE}.register_cdc_companion_table", register_companion or AsyncMock()),
+        patch(f"{_PIPELINE_SYNC_MODULE}.register_cdc_companion_table", AsyncMock()),
         patch(f"{_REPARTITION_MODULE}.maybe_flag_for_repartition", AsyncMock()),
     ):
-        result = await run_post_load_operations(
+        await run_post_load_operations(
             job=job,
             schema=schema,
             source=MagicMock(),
@@ -122,8 +112,6 @@ async def _run_post_load(
             resource=resource,
             cdc_write_mode=cdc_write_mode,
         )
-    if results is not None:
-        results.append(result)
     return run_scheduled, prepare_s3
 
 
@@ -165,97 +153,38 @@ class TestRunPostLoadDeltaMaintenance:
         # was called with that stale snapshot, raising FileNotFoundError on files maintenance just removed.
         schema = _make_schema(is_cdc=is_cdc)
         post_maintenance_uris = ["s3://bucket/orders/compacted.parquet"]
-        helper = _make_helper(file_uris=post_maintenance_uris, file_sizes={"compacted.parquet": 123})
+        helper = _make_helper(file_uris=post_maintenance_uris)
 
         _, prepare_s3 = await _run_post_load(schema, helper, cdc_write_mode="incremental" if is_cdc else None)
 
         prepare_s3.assert_awaited_once()
         assert prepare_s3.await_args is not None
         assert prepare_s3.await_args.args[2] == post_maintenance_uris
-        assert prepare_s3.await_args.kwargs["file_sizes"] == {"compacted.parquet": 123}
-
-    @pytest.mark.asyncio
-    async def test_a_refreshed_file_listing_also_refreshes_the_file_sizes(self) -> None:
-        # A retry after a vanished source file copies the files a compaction just wrote. Their sizes
-        # must reach the copy step with them, or the old snapshot's sizes select the copy path.
-        helper = _make_helper(file_uris=["s3://bucket/orders/p0.parquet"], file_sizes={"p0.parquet": 1})
-
-        _, prepare_s3 = await _run_post_load(_make_schema(is_cdc=False), helper)
-
-        assert prepare_s3.await_args is not None
-        helper.get_file_uris.return_value = ["s3://bucket/orders/compacted.parquet"]
-        helper.get_delta_table.return_value._table.get_add_file_sizes.return_value = {"compacted.parquet": 2}
-        refreshed = await prepare_s3.await_args.kwargs["refresh_file_uris"]()
-
-        assert refreshed == ["s3://bucket/orders/compacted.parquet"]
-        assert prepare_s3.await_args.kwargs["file_sizes"] == {"compacted.parquet": 2}
 
 
 class TestRegisterTableRowCount:
-    @parameterized.expand([("log_count", 40_000_000), ("log_without_statistics", None)])
-    @pytest.mark.asyncio
-    async def test_passes_the_delta_log_count_to_the_registration(self, _name: str, live_row_count: int | None) -> None:
-        # Without the log count, registration counts every published file through chdb or the
-        # ClickHouse cluster on each sync of an incremental table, and a full refresh that ran over
-        # several attempts stores the rows of its last attempt as the table size.
-        validate = AsyncMock()
-
-        await _run_post_load(_make_schema(is_cdc=False), _make_helper(live_row_count=live_row_count), validate=validate)
-
-        validate.assert_awaited_once()
-        assert validate.await_args is not None
-        assert validate.await_args.kwargs["live_row_count"] == live_row_count
-
-
-class TestPostLoadTableSize:
     @parameterized.expand(
         [
-            ("size_from_the_log", False, None, 12.5, True),
-            ("empty_table", False, None, 0.0, True),
-            # The post-import workflow must still measure a table whose log gave no size.
-            ("no_size_from_the_log", False, None, None, False),
-            ("cdc_main_table", True, "incremental_merge", 12.5, True),
+            ("cumulative", True, 10, 40_000_000),
+            ("full_refresh_with_rows", False, 10, None),
+            ("full_refresh_reporting_zero", False, 0, 40_000_000),
         ]
     )
     @pytest.mark.asyncio
-    async def test_registers_the_log_size_and_reports_whether_it_was_written(
-        self, _name: str, is_cdc: bool, cdc_write_mode: str | None, live_size_mib: float | None, expect_written: bool
+    async def test_passes_the_delta_log_count_when_the_run_count_is_not_the_table_size(
+        self, _name: str, cumulative: bool, row_count: int, expected: int | None
     ) -> None:
-        schema = _make_schema(is_cdc=is_cdc)
+        # Without the log count, registration counts every published file through chdb or the
+        # ClickHouse cluster on each sync of an incremental table.
+        schema = _make_schema(is_cdc=False)
+        schema.table_row_count_is_cumulative = cumulative
         validate = AsyncMock()
-        results: list[PostLoadResult] = []
 
-        await _run_post_load(
-            schema,
-            _make_helper(live_size_mib=live_size_mib),
-            cdc_write_mode=cdc_write_mode,
-            validate=validate,
-            results=results,
-        )
+        await _run_post_load(schema, _make_helper(live_row_count=40_000_000), validate=validate, row_count=row_count)
 
+        validate.assert_awaited_once()
         assert validate.await_args is not None
-        assert validate.await_args.kwargs["live_size_mib"] == live_size_mib
-        assert results == [PostLoadResult(queryable_folder="orders__query_1", table_size_written=expect_written)]
-
-    @pytest.mark.asyncio
-    async def test_a_companion_write_sizes_the_companion_and_not_the_main_table(self) -> None:
-        # The companion is a different Delta table. Its size on the main table would replace the
-        # size of the snapshot data.
-        schema = _make_schema(is_cdc=True, cdc_table_mode="both")
-        validate = AsyncMock()
-        register_companion = AsyncMock()
-
-        await _run_post_load(
-            schema,
-            _make_helper(live_size_mib=3.0),
-            cdc_write_mode="scd2_append",
-            validate=validate,
-            register_companion=register_companion,
-        )
-
-        validate.assert_not_awaited()
-        assert register_companion.await_args is not None
-        assert register_companion.await_args.kwargs["live_size_mib"] == 3.0
+        assert validate.await_args.kwargs["live_row_count"] == expected
 
 
 _STEP_PHASES = [
@@ -427,7 +356,7 @@ class TestZeroRowRunFinalizesBookkeeping:
                 logger=logger,
             )
 
-        assert result == PostLoadResult(queryable_folder=None, table_size_written=False)
+        assert result is None
         set_complete.assert_awaited_once()
         synced.assert_awaited_once()
 
@@ -448,6 +377,13 @@ class TestGetIncrementalFieldValue:
     def test_returns_max_of_configured_column(self):
         table = pa.table({"id": ["a", "b"], "created": [10, 20]})
         assert get_incremental_field_value(self._schema("created"), table) == 20
+
+    def test_resolves_rooted_single_segment_path(self):
+        # "$.updated_at" parses to a single segment, so the flat-column fallback must normalize that
+        # parsed segment; normalizing the raw string misses the real "updated_at" column and raises.
+        table = pa.table({"updated_at": [10, 20]})
+
+        assert get_incremental_field_value(self._schema("$.updated_at"), table) == 20
 
     def test_missing_column_raises_actionable_error_matched_by_non_retryable_map(self):
         # A label like "created_at" persisted instead of the real field must fail with guidance
@@ -479,6 +415,144 @@ class TestGetIncrementalFieldValue:
         schema = self._schema("updated_at", sync_type=sync_type)
 
         assert get_incremental_field_value(schema, table) is None
+
+    _NESTED_TABLE = pa.table({"meta": ['{"updated_at": 10}', '{"updated_at": 20}']})
+
+    @parameterized.expand(
+        [
+            ("dotted_max", "meta.updated_at", "max", 20),
+            ("dotted_min", "meta.updated_at", "min", 10),
+            ("jsonpath_root_max", "$.meta.updated_at", "max", 20),
+            ("jsonpath_root_min", "$.meta.updated_at", "min", 10),
+        ]
+    )
+    def test_resolves_nested_member(self, _name: str, incremental_field: str, aggregate: str, expected: int):
+        assert (
+            get_incremental_field_value(self._schema(incremental_field), self._NESTED_TABLE, aggregate=aggregate)
+            == expected
+        )
+
+    def test_resolves_deeply_nested_member(self):
+        table = pa.table({"meta": ['{"dates": {"updated_at": 10}}', '{"dates": {"updated_at": 30}}']})
+
+        assert get_incremental_field_value(self._schema("meta.dates.updated_at"), table) == 30
+
+    def test_missing_nested_member_raises_actionable_error_matched_by_non_retryable_map(self):
+        # The member is absent from every record's JSON, so this must fail with guidance rather
+        # than silently returning None and freezing the cursor.
+        table = pa.table({"id": ["a"], "meta": ['{"created_at": 10}']})
+
+        with pytest.raises(IncrementalFieldMissingFromDataError) as exc_info:
+            get_incremental_field_value(self._schema("meta.updated_at"), table)
+
+        message = str(exc_info.value)
+        assert "meta.updated_at" in message
+        matching_keys = [key for key in Any_Source_Errors if key in message]
+        assert matching_keys, "exception message must stay matched by an Any_Source_Errors entry"
+
+    def test_nested_member_wins_over_flattened_column_of_the_same_name(self):
+        # "meta.updated_at" normalizes to "meta_updated_at", and a flattened source can legitimately
+        # have both. The dotted path names the nested member, so the nested value must win.
+        table = pa.table({"meta": ['{"updated_at": 10}', '{"updated_at": 20}'], "meta_updated_at": [999, 999]})
+
+        assert get_incremental_field_value(self._schema("meta.updated_at"), table) == 20
+
+    def test_rejected_path_name_still_resolves_the_flat_column(self):
+        # The parser rejects "cursor[utc]", but its normalized name can still identify a real flat
+        # column, so resolution must retain the flat-column fallback for rejected paths.
+        flat_name = normalize_column_name("cursor[utc]")
+        table = pa.table({"id": ["a", "b"], flat_name: [10, 20]})
+
+        assert get_incremental_field_value(self._schema("cursor[utc]"), table) == 20
+
+    def test_nested_member_skips_null_parents_and_null_values(self):
+        # A null parent, an explicit JSON null, and a record without the member all contribute
+        # nothing; the aggregate still sees the one real value.
+        table = pa.table({"meta": [None, '{"updated_at": 20}', '{"updated_at": null}', "{}"]})
+
+        assert get_incremental_field_value(self._schema("meta.updated_at"), table) == 20
+
+    def test_null_parent_does_not_mask_a_missing_nested_member(self):
+        # A null parent is not an observation of the member: if no record actually carries it, the
+        # configured path is wrong and the sync must fail loudly rather than freeze the watermark.
+        table = pa.table({"meta": [None, '{"created_at": 10}']})
+
+        with pytest.raises(IncrementalFieldMissingFromDataError):
+            get_incremental_field_value(self._schema("meta.updated_at"), table)
+
+    @parameterized.expand(
+        [
+            ("all_null_parents", pa.array([None, None], type=pa.string())),
+            ("empty_column", pa.array([], type=pa.string())),
+        ]
+    )
+    def test_nested_member_with_no_values_returns_none(self, _name: str, column: pa.Array):
+        # Nothing to aggregate is a legitimate empty batch, not a missing field.
+        table = pa.table({"meta": column})
+
+        assert get_incremental_field_value(self._schema("meta.updated_at"), table) is None
+
+    @parameterized.expand(
+        [
+            ("non_object_parent", pa.table({"meta": ["5", "7"]})),
+            ("invalid_json", pa.table({"meta": ["not json at all"]})),
+        ]
+    )
+    def test_unusable_nested_values_raise_missing_field_error(self, _name: str, table: pa.Table):
+        # A cursor must be a scalar member of an object; a non-object parent or unparseable JSON can
+        # never produce one, so fail loudly with guidance instead of freezing the watermark.
+        with pytest.raises(IncrementalFieldMissingFromDataError):
+            get_incremental_field_value(self._schema("meta.updated_at"), table)
+
+    def test_all_null_nested_root_falls_back_to_the_flat_column(self):
+        # An all-null root is not proof the field is absent: the normalized flat column can still
+        # carry it, and the pre-fix extractor read that column directly. Leaving the cursor alone
+        # here silently stalls a sync whose watermark is available.
+        table = pa.table({"meta": pa.array([None, None], type=pa.string()), "meta_updated_at": [10, 20]})
+
+        assert get_incremental_field_value(self._schema("meta.updated_at"), table) == 20
+
+    def test_rooted_multi_segment_path_falls_back_to_the_flat_column(self):
+        # The "$." prefix is stripped by the parser, so the flat lookup must normalize the parsed
+        # path rather than the raw configured string.
+        table = pa.table({"meta_updated_at": [10, 20]})
+
+        assert get_incremental_field_value(self._schema("$.meta.updated_at"), table) == 20
+
+
+class TestParseMemberPath:
+    @parameterized.expand(
+        [
+            ("plain_member", "updated_at", ["updated_at"]),
+            ("dotted", "meta.updated_at", ["meta", "updated_at"]),
+            ("deeply_dotted", "meta.dates.updated_at", ["meta", "dates", "updated_at"]),
+            ("jsonpath_root", "$.meta.updated_at", ["meta", "updated_at"]),
+            ("surrounding_whitespace_stripped", "  meta.updated_at  ", ["meta", "updated_at"]),
+            # Real JSON keys are not Python identifiers; a hyphenated member must survive parsing.
+            ("hyphenated_member", "meta.updated-at", ["meta", "updated-at"]),
+        ]
+    )
+    def test_accepts_simple_member_paths(self, _name: str, path: str, expected: list[str]) -> None:
+        assert parse_member_path(path) == expected
+
+    @parameterized.expand(
+        [
+            ("empty", ""),
+            ("bare_root", "$"),
+            ("recursive_descent", "$..updated_at"),
+            ("array_index", "$.meta[0].updated_at"),
+            ("wildcard", "meta[*].updated_at"),
+            ("filter", "meta[?(@.id > 1)].updated_at"),
+            ("quoted_member", "meta.'updated_at'"),
+            ("empty_segment", "meta..updated_at"),
+            ("trailing_dot", "meta."),
+            ("leading_dot", ".meta"),
+            ("padded_segment", "meta. updated_at"),
+            ("question_mark", "meta.updated_at?"),
+        ]
+    )
+    def test_rejects_unsupported_syntax(self, _name: str, path: str) -> None:
+        assert parse_member_path(path) is None
 
 
 class TestUpdateJobRowCount:
